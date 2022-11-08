@@ -1,5 +1,7 @@
 import os
 import time
+import argparse
+import copy
 import numpy as np
 import pandas as pd
 import torch
@@ -9,87 +11,38 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms, models
 from torchvision.utils import make_grid
 import torch.optim as optim 
+from torch.optim import lr_scheduler
+from datasets import get_train_valid_loader
 from ResultWriter import ResultWriter
-from statistics import AverageMeter, ProgressMeter
+from statistics import accuracy, AverageMeter, ProgressMeter
+from torchsummary import summary
 
 from PIL import Image
 import matplotlib.pyplot as plt
 
-
-# ROOT_DIR = '../input/datasets'
-# TRAIN_DIR = '../input/datasets/final_train'
-# VAL_DIR = '../input/datasets/val'
-# TEST_DIR  = '../input/datasets/test'
-
-# image is in jpg format
-# cat0.jpg dog.0.jpg
-
-# dogs_list = os.listdir(os.path.join(TRAIN_DIR,"dog"))
-# cats_list = os.listdir(os.path.join(TRAIN_DIR,"cat"))
-# dogs_val = os.listdir(os.path.join(VAL_DIR,"dog"))
-# cats_val = os.listdir(os.path.join(VAL_DIR,"cat"))
-# test_imgs = os.listdir(TEST_DIR)
-
-# Concat two lists to form train imgs
-# train_imgs =  dogs_list + cats_list
-# val_imgs = dogs_val + cats_val
-
-# train_imgs = os.listdir(TRAIN_DIR)
-# val_imgs = os.listdir(VAL_DIR)
-# test_imgs = os.listdir(TEST_DIR)
-
-# Image labels
-# class_to_int = {"dog" : 0, "cat" : 1}
-# int_to_class = {0 : "dog", 1 : "cat"}
-
-# transformation (scaling, rotation & flipping)
-train_transform= transforms.Compose([
-    transforms.Resize((224, 224)), # Require size by Resnet-18
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(15),
-    transforms.ToTensor(),
-    transforms.Normalize((0.485, 0.456, 0.406),
-                        (0.229, 0.224, 0.225))
-])
-
-valid_transform= transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize((0.485, 0.456, 0.406),
-                        (0.229, 0.224, 0.225))
-])
-
-# def accuracy(preds, trues):
-    
-#     ### Converting preds to 0 or 1
-#     preds = [1 if preds[i] >= 0.5 else 0 for i in range(len(preds))]
-    
-#     ### Calculating accuracy by comparing predictions with true labels
-#     acc = [1 if preds[i] == trues[i] else 0 for i in range(len(preds))]
-    
-#     ### Summing over all correct predictions
-#     acc = np.sum(acc) / len(preds)
-    
-#     return (acc * 100)
-
-def train(model, dataloader, loader_len, criterion, optimizer, scheduler, use_gpu, epoch, save_path, save_file_name='train.csv'):
+def train(args, model, dataloader, loader_len, criterion, optimizer, scheduler, use_gpu, epoch, save_file_name='train.csv'):
     
     ### Local Parameters
-    resultWriter = ResultWriter(save_path, save_file_name)
+    resultWriter = ResultWriter(args.save_path, save_file_name)
     if epoch == 0:
         resultWriter.create_csv(['epoch', 'loss', 'top-1', 'top-5', 'lr'])
 
     # use gpu or not
     device = torch.device('cuda' if use_gpu else 'cpu')
+
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
-    accuracy = AverageMeter('Acc', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
-    loader_len,
-    [batch_time, data_time, losses, accuracy],
-    prefix="Epoch: [{}]".format(epoch))
+        loader_len,
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
     
+    # update lr here if using stepLR
+    scheduler.step(epoch)
+
     # Set model to training mode
     model.train()
 
@@ -107,14 +60,15 @@ def train(model, dataloader, loader_len, criterion, optimizer, scheduler, use_gp
         outputs = model(inputs)
         loss = criterion(outputs, labels)
 
-        #measure accuracy
-        acc = torch.sum(preds == labels.data)
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(outputs, labels, topk=(1, 5))
+
         #Reseting Gradients
         optimizer.zero_grad()
 
         losses.update(loss.item(), inputs.size(0))
-        accuracy.update(acc, inputs.size(0))
-        # running_loss += loss.item() * inputs.size(0)
+        top1.update(acc1[0], inputs.size(0))
+        top5.update(acc5[0], inputs.size(0))
         
         # constant lr now
 
@@ -127,165 +81,251 @@ def train(model, dataloader, loader_len, criterion, optimizer, scheduler, use_gp
         batch_time.update(time.time() - end)
         end = time.time()
         
-        progress.display(i)
+        if i % args.print_freq == 0:
+            progress.display(i)
     
-    resultWriter.write_csv([epoch, losses.avg, top1.avg.item(), top5.avg.item()])
+    resultWriter.write_csv([epoch, losses.avg, top1.avg.item(), top5.avg.item(), scheduler.optimizer.param_groups[0]['lr']])
     # print('[Train #{}] Loss: {:.4f} Acc: {:.4f}% Time: {:.4f}s'.format(epoch, epoch_loss, epoch_acc, time.time() - start_time))
-    print('Train ***    Loss:{losses.avg:.2e}    Acc@1:{accuracy.avg:.2f} '.format(losses=losses, accuracy=accuracy))
-    if epoch != 0:
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        torch.save(model.state_dict(), os.path.join(save_path, "epoch_" + str(epoch) + ".pth"))
-
-def val(valid_loader, best_val_acc, save_file_name='test.csv'):
+    print('lr:%.6f' % scheduler.optimizer.param_groups[0]['lr'])
+    print('Train ***    Loss:{losses.avg:.2e}    Acc@1:{top1.avg:.2f}    Acc@5:{top5.avg:.2f}'.format(losses=losses, top1=top1, top5=top5))
     
-    # Set model to evaluate mode
+    if epoch % args.save_epoch_freq == 0 and epoch != 0:
+        if not os.path.exists(args.save_path):
+            os.makedirs(args.save_path)
+        torch.save(model.state_dict(), os.path.join(args.save_path, "epoch_" + str(epoch) + ".pth"))
+
+def validate(args, model, dataloader, loader_len, criterion, use_gpu, epoch, ema=None, save_file_name='val.csv'):
+    '''
+    validate the model
+    '''
+
+    # save result every epoch
+    resultWriter = ResultWriter(args.save_path, save_file_name)
+    if epoch == 0:
+        resultWriter.create_csv(['epoch', 'loss', 'top-1', 'top-5'])
+
+    device = torch.device('cuda' if use_gpu else 'cpu')
+
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        loader_len,
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
+
     model.eval()
 
-    ### Local Parameters
-    epoch_loss = []
-    epoch_acc = []
-    start_time = time.time()
-    
-    ###Iterating over data loader
-    for i, (inputs, labels) in enumerate(valid_loader):
+    end = time.time()
+
+    # Iterate over data
+    for i, (inputs, labels) in enumerate(dataloader):
+        # measure data loading time
+        data_time.update(time.time() - end)
         
-        #Loading images and labels to device
         inputs = inputs.to(device)
         labels = labels.to(device)
-        
-        #Forward
-        # preds = model(inputs)
-        outputs = model(inputs)
-        _, preds = torch.max(outputs, 1)
-        
-        #Calculating Loss
-        loss = criterion(outputs, labels)
-        epoch_loss.append(loss)
-        
-        #Calculating Accuracy
-        acc = accuracy(preds, labels)
-        epoch_acc.append(acc)
+
+        with torch.set_grad_enabled(False):
+            
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(outputs, labels, topk=(1, 5))
+            
+            losses.update(loss.item(), inputs.size(0))
+            top1.update(acc1[0], inputs.size(0))
+            top5.update(acc5[0], inputs.size(0))
+            batch_time.update(time.time() - end)
+            end = time.time()
+            
+
+    # if args.ema_decay > 0:
+    #     # restore the origin parameters after val
+    #     ema.restore()
+    # write val result to file
+    resultWriter.write_csv([epoch, losses.avg, top1.avg.item(), top5.avg.item()])
+
+    print(' Val  ***    Loss:{losses.avg:.2e}    Acc@1:{top1.avg:.2f}    Acc@5:{top5.avg:.2f}'.format(losses=losses, top1=top1, top5=top5))
     
-    ###Overall Epoch Results
-    end_time = time.time()
-    total_time = end_time - start_time
+    if epoch % args.save_epoch_freq == 0 and epoch != 0:
+        if not os.path.exists(args.save_path):
+            os.makedirs(args.save_path)
+        torch.save(model.state_dict(), os.path.join(args.save_path, "epoch_" + str(epoch) + ".pth"))
+
+    top1_acc = top1.avg.item()
+    top5_acc = top5.avg.item()
     
-    ###Acc and Loss
-    epoch_loss = np.mean(epoch_loss)
-    epoch_acc = np.mean(epoch_acc)
+    return top1_acc, top5_acc
+
+def train_model(args, model, dataloader, loaders_len, criterion, optimizer, scheduler, use_gpu):
+    '''
+    train the model
+    '''
+    since = time.time()
+
+    # ema = None
+    # exponential moving average
+    # if args.ema_decay > 0:
+    #     ema = EMA(model, decay=args.ema_decay)
+    #     ema.register()
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
+    correspond_top5 = 0.0
+
+    for epoch in range(args.start_epoch, args.num_epochs):
+
+        epoch_time = time.time()
+        train(args, model, dataloader['train'], loaders_len['train'], criterion, optimizer, scheduler, use_gpu, epoch)
+        top1_acc, top5_acc  = validate(args, model, dataloader['val'], loaders_len['val'], criterion, use_gpu, epoch)
+        # test(args, model, testloader, test_loader_len, criterion, use_gpu, epoch)
+        epoch_time = time.time() - epoch_time
+        print('Time of epoch-[{:d}/{:d}] : {:.0f}h {:.0f}m {:.0f}s\n'.format(epoch, args.num_epochs, epoch_time // 3600, (epoch_time % 3600) // 60, epoch_time % 60))
+
+        # deep copy the model if it has higher top-1 accuracy
+        if top1_acc > best_acc:
+            best_acc = top1_acc
+            correspond_top5 = top5_acc
+            # if args.ema_decay > 0:
+            #     ema.apply_shadow()
+            best_model_wts = copy.deepcopy(model.state_dict())
+            # if args.ema_decay > 0:
+            #     ema.restore()
+
+    print(os.path.split(args.save_path)[-1])
+    print('Best val top-1 Accuracy: {:4f}'.format(best_acc))
+    print('Corresponding top-5 Accuracy: {:4f}'.format(correspond_top5))
     
-    ###Storing results to logs
-    val_logs["loss"].append(epoch_loss)
-    val_logs["accuracy"].append(epoch_acc)
-    val_logs["time"].append(total_time)
-    
-    ###Saving best model
-    if epoch_acc > best_val_acc:
-        best_val_acc = epoch_acc
-        torch.save(model.state_dict(),"resnet18_best.pth")
-        
-    return epoch_loss, epoch_acc, total_time, best_val_acc
+    time_elapsed = time.time() - since
+    print('Training complete in {:.0f}h {:.0f}m {:.0f}s'.format(time_elapsed // 3600, (time_elapsed % 3600) // 60, time_elapsed % 60))
+
+    # load best model weights
+    model.load_state_dict(best_model_wts)
+    # save best model weights
+    if args.save:
+        torch.save(model.state_dict(), os.path.join(args.save_path, 'best_model_wts-' + '{:.2f}'.format(best_acc) + '.pth'))
+    return model
 
 
 if __name__ == "__main__":
+    # Construct the argument parser.
+    parser = argparse.ArgumentParser(description='PyTorch implementation of MobileNetV3')
+    # Root catalog of images
+    # parser.add_argument('--data-dir', type=str, default='/media/data2/chenjiarong/ImageData')
+    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--num-epochs', type=int, default=5)
+    parser.add_argument('--lr', type=float, default=0.1)
+    parser.add_argument('--num-workers', type=int, default=4)
+    #parser.add_argument('--gpus', type=str, default='0')
+    parser.add_argument('--print-freq', type=int, default=1000)
+    parser.add_argument('--save-epoch-freq', type=int, default=1)
+    parser.add_argument('--save-path', type=str, default='../outputs/trained_model')
+    parser.add_argument('-save', default=False, action='store_true', help='save model or not')
+    parser.add_argument('--resume', type=str, default='', help='For training from one checkpoint')
+    parser.add_argument('--start-epoch', type=int, default=0, help='Corresponding to the epoch of resume')
+    parser.add_argument('--ema-decay', type=float, default=0.9999, help='The decay of exponential moving average ')
+    parser.add_argument('--dataset', type=str, default='ImageNet', help='The dataset to be trained')
+    parser.add_argument('--width-multiplier', type=float, default=1.0, help='width multiplier')
+    parser.add_argument('--dropout', type=float, default=0.2, help='dropout rate')
+    parser.add_argument('--lr-decay', type=str, default='step', help='learning rate decay method, step, cos or sgdr')
+    parser.add_argument('--step-size', type=int, default=3, help='step size in stepLR()')
+    parser.add_argument('--gamma', type=float, default=0.99, help='gamma in stepLR()')
+    parser.add_argument('--optimizer', type=str, default='sgd', help='optimizer')
+    parser.add_argument('--weight-decay', type=float, default=1e-5, help='weight decay')
+    parser.add_argument('--bn-momentum', type=float, default=0.1, help='momentum in BatchNorm2d')
+    parser.add_argument('-use-seed', default=False, action='store_true', help='using fixed random seed or not')
+    parser.add_argument('--seed', type=int, default=1, help='random seed')
+    parser.add_argument('-deterministic', default=True, action='store_true', help='torch.backends.cudnn.deterministic')
+    parser.add_argument('-zero-gamma', default=False, action='store_true', help='zero gamma in BatchNorm2d when init')
+    args = parser.parse_args()
+
     TRAIN_DIR = '../datasets/train'
-    VAL_DIR = '../datasets/val'
+    VALID_DIR = '../datasets/val'
     TEST_DIR = '../datasets/test'
     save_path = '../output'
 
-    train_dataset = datasets.ImageFolder(root=TRAIN_DIR, transform=train_transform)
-    classes = train_dataset.classes
-    print(classes)
-    train_size = len(train_dataset)
-    print("Train size: ", train_size)
+    #define train transform
+    train_transform= transforms.Compose([
+        transforms.Resize((64, 64)), # Require size by Resnet-18
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(15),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406),
+                            (0.229, 0.224, 0.225))
+    ])
 
-    valid_dataset = datasets.ImageFolder(root=VAL_DIR, transform=valid_transform)
-    valid_size = len(valid_dataset)
-    print("Valid size: ", valid_size)
+    valid_transform= transforms.Compose([
+        transforms.Resize((64, 64)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406),
+                            (0.229, 0.224, 0.225))
+    ])
 
-    # Check GPU availability
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    # use gpu or not
+    use_gpu = torch.cuda.is_available()
 
-    # data loader
-    train_loader = DataLoader(
-        train_dataset,batch_size=64,num_workers=4,pin_memory=True
-    )
-    valid_loader = DataLoader(
-        valid_dataset,batch_size=16,num_workers=4,pin_memory=True
-    )
+    print("use_gpu:{}".format(use_gpu))
+    if use_gpu:
+        if args.deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+        print('torch.backends.cudnn.deterministic:' + str(args.deterministic))
+    
+    train_loader, valid_loader, train_size, valid_size,\
+    classes = get_train_valid_loader(TRAIN_DIR, 
+                                    VALID_DIR,
+                                    train_batch_size = 64,
+                                    val_batch_size = 16,
+                                    train_transform = train_transform,
+                                    valid_transform = valid_transform,
+                                    num_workers = 4,
+                                    pin_memory = True)
 
     dataloaders = {'train' : train_loader, 'val' : valid_loader}
     loaders_len = {'train': train_size, 'val' : valid_size}
 
-    # # Create model here
-    # model = models.resnet18(pretrained=False)
-    model = models.resnet18(pretrained = True)
-    num_features = model.fc.in_features     #extract fc layers features
-    model.fc = nn.Linear(num_features, 2) #(num_of_class == 2)
+    print(f"[INFO]: Number of training images: {train_size}")
+    print(f"[INFO]: Number of validation images: {valid_size}")
+    print(f"[INFO]: Class names: {classes}\n")
+
+    # Create model here
+    # model = models.resnet18(pretrained = True)
+    model = models.resnet18()
     # num_features = model.fc.in_features     #extract fc layers features
+    # model.fc = nn.Linear(num_features, 2) #(num_of_class == 2)
     # model.fc = nn.Sequential(
     #     nn.Linear(2048, 1, bias = True),
     #     nn.Sigmoid()
     # )
+    if use_gpu:
+        if torch.cuda.device_count() > 1:
+            model = torch.nn.DataParallel(model)
+        model.to(torch.device('cuda'))
+    else:
+        model.to(torch.device('cpu'))
+
+    # summary(model, input_size = (3, 64, 64))
+    #Loss Function
+    criterion = nn.CrossEntropyLoss() 
 
     # Optimizer
-    optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
 
     # Learning Rate Scheduler
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size = 5, gamma = 0.5)
-
-    #Loss Function
-    criterion = nn.CrossEntropyLoss()  #(set loss function)
-
-    # Logs - Helpful for plotting after training finishes
-    train_logs = {"loss" : [], "accuracy" : [], "time" : []}
-    val_logs = {"loss" : [], "accuracy" : [], "time" : []}
-
-    # Loading model to device
-    model.to(device)
-
-    # No of epochs 
-    epochs = 5
-
-    best_val_acc = 0
-
-    # train_one_epoch(train_loader)
-    for epoch in range(epochs):
-        
-        ###Training
-        loss, acc, _time = train(model, train_loader, train_size, save_path)
-        
-        #Print Epoch Details
-        print("\nTraining")
-        print("Epoch {}".format(epoch+1))
-        print("Loss : {}".format(round(loss, 4)))
-        print("Acc : {}".format(round(acc, 4)))
-        print("Time : {}".format(round(_time, 4)))
-        
-        ###Validation
-        loss, acc, _time, best_val_acc = val(model, valid_loader, valid_size, best_val_acc)
-        
-        #Print Epoch Details
-        print("\nValidating")
-        print("Epoch {}".format(epoch+1))
-        print("Loss : {}".format(round(loss, 4)))
-        print("Acc : {}".format(round(acc, 4)))
-        print("Time : {}".format(round(_time, 4)))
-
-    #Plotting results
-    #Loss
-    plt.title("Loss")
-    plt.plot(np.arange(1, 11, 1), train_logs["loss"], color = 'blue')
-    plt.plot(np.arange(1, 11, 1), val_logs["loss"], color = 'yellow')
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.show()
-
-    #Accuracy
-    plt.title("Accuracy")
-    plt.plot(np.arange(1, 11, 1), train_logs["accuracy"], color = 'blue')
-    plt.plot(np.arange(1, 11, 1), val_logs["accuracy"], color = 'yellow')
-    plt.xlabel("Epochs")
-    plt.ylabel("Accuracy")
-    plt.show()
+    lr_scheduler = lr_scheduler.StepLR(optimizer, step_size = args.step_size, gamma = args.gamma)
+    
+    model = train_model(args=args,
+                    model=model,
+                    dataloader=dataloaders,
+                    loaders_len=loaders_len,
+                    criterion=criterion,
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
+                    use_gpu=use_gpu)
