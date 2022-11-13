@@ -19,3 +19,8 @@ checkpoint = torch.load("../outputs/trained_model/checpoint_epoch_9.pt")
 ```
 
 6. Change the checkpoint name to load the specific model checkpoint
+
+## Extra file
+1. The extra folder consists of scripts for training of VGG-16 model and Cifar-10 Datasets on Resnet-18
+
+2. Again, make sure all the necessary dependencies are install to run the scripts.
