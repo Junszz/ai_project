@@ -7,7 +7,7 @@ git clone https://github.com/Junszz/ai_project
 ```
 
 2. Place the dataset into this folder following this structure
-![Image](images/file.png)
+- ![Image](images/file.png)
 
 3. Make sure to install all the necessary dependencies
 
